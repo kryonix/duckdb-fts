@@ -1,0 +1,78 @@
+# name: test/sql/fts/test_chunked_indexing_high_level.test
+# description: High-level chunked FTS index creation
+# group: [fts]
+
+require fts
+
+require no_alternative_verify
+
+statement ok
+CREATE TABLE chunked_high_level_docs(id VARCHAR, body VARCHAR, author VARCHAR)
+
+statement ok
+INSERT INTO chunked_high_level_docs VALUES
+    ('doc1', 'alpha beta alpha', 'alice'),
+    ('doc2', 'beta gamma', 'bob'),
+    ('doc3', 'gamma delta', 'alice')
+
+statement ok
+PRAGMA create_fts_index_chunked('chunked_high_level_docs', 'id', 'body', 'author', stemmer='none', stopwords='none', ignore='[^a-z0-9]+', overwrite=true, layered_search=true, cluster_terms=true, chunk_size=2, termid_chunk_size=2)
+
+query II
+SELECT term, df
+FROM fts_main_chunked_high_level_docs.dict
+ORDER BY term
+----
+alice	2
+alpha	1
+beta	2
+bob	1
+delta	1
+gamma	2
+
+query I
+SELECT count(*)
+FROM fts_main_chunked_high_level_docs.terms
+----
+10
+
+query I
+SELECT count(*)
+FROM information_schema.tables
+WHERE table_schema = 'fts_main_chunked_high_level_docs'
+  AND table_name IN ('__build_state', '__build_term_df', '__build_terms', '__build_dict_final')
+----
+0
+
+query I
+SELECT docname
+FROM fts_main_chunked_high_level_docs.search_layered_bm25('alpha', fields := 'body', enable_short_fuzzy := false)
+----
+doc1
+
+statement ok
+PRAGMA create_fts_index_chunked('chunked_high_level_docs', 'id', 'body', 'author', stemmer='none', stopwords='none', ignore='[^a-z0-9]+', overwrite=true, layered_search=true)
+
+query II
+SELECT term, df
+FROM fts_main_chunked_high_level_docs.dict
+ORDER BY term
+----
+alice	2
+alpha	1
+beta	2
+bob	1
+delta	1
+gamma	2
+
+statement error
+PRAGMA create_fts_index_chunked('chunked_high_level_docs', 'id', 'body', chunk_size=0, overwrite=true)
+----
+
+statement error
+PRAGMA create_fts_index_chunked('chunked_high_level_docs', 'id', 'body', chunk_size_policy='bad_policy', overwrite=true)
+----
+
+statement error
+PRAGMA create_fts_index_chunked('chunked_high_level_docs', 'id', 'body', termid_chunk_size=0, overwrite=true)
+----

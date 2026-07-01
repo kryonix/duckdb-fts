@@ -74,11 +74,92 @@ static void LoadInternal(ExtensionLoader &loader) {
   create_fts_index_func.named_parameters["layered_search"] =
       LogicalType::BOOLEAN;
 
+  auto create_fts_index_chunked_init_func = PragmaFunction::PragmaCall(
+      "create_fts_index_chunked_init",
+      FTSIndexing::CreateFTSIndexChunkedInitQuery,
+      {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR);
+  create_fts_index_chunked_init_func.named_parameters["stemmer"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_init_func.named_parameters["stopwords"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_init_func.named_parameters["ignore"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_init_func.named_parameters["strip_accents"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_init_func.named_parameters["lower"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_init_func.named_parameters["overwrite"] =
+      LogicalType::BOOLEAN;
+
+  auto create_fts_index_chunked_func = PragmaFunction::PragmaCall(
+      "create_fts_index_chunked", FTSIndexing::CreateFTSIndexChunked,
+      {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR);
+  create_fts_index_chunked_func.named_parameters["stemmer"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_func.named_parameters["stopwords"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_func.named_parameters["ignore"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_func.named_parameters["strip_accents"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_func.named_parameters["lower"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_func.named_parameters["overwrite"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_func.named_parameters["cluster_terms"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_func.named_parameters["layered_search"] =
+      LogicalType::BOOLEAN;
+  create_fts_index_chunked_func.named_parameters["chunk_size"] =
+      LogicalType::BIGINT;
+  create_fts_index_chunked_func.named_parameters["termid_chunk_size"] =
+      LogicalType::BIGINT;
+  create_fts_index_chunked_func.named_parameters["chunk_size_policy"] =
+      LogicalType::VARCHAR;
+
+  auto create_fts_index_chunked_append_func = PragmaFunction::PragmaCall(
+      "create_fts_index_chunked_append",
+      FTSIndexing::CreateFTSIndexChunkedAppendQuery, {LogicalType::VARCHAR});
+  create_fts_index_chunked_append_func.named_parameters["rowid_start"] =
+      LogicalType::BIGINT;
+  create_fts_index_chunked_append_func.named_parameters["rowid_end"] =
+      LogicalType::BIGINT;
+
+  auto create_fts_index_chunked_cluster_begin_func =
+      PragmaFunction::PragmaCall(
+          "create_fts_index_chunked_cluster_begin",
+          FTSIndexing::CreateFTSIndexChunkedClusterBeginQuery,
+          {LogicalType::VARCHAR});
+
+  auto create_fts_index_chunked_cluster_append_func =
+      PragmaFunction::PragmaCall(
+          "create_fts_index_chunked_cluster_append",
+          FTSIndexing::CreateFTSIndexChunkedClusterAppendQuery,
+          {LogicalType::VARCHAR});
+  create_fts_index_chunked_cluster_append_func
+      .named_parameters["termid_start"] = LogicalType::BIGINT;
+  create_fts_index_chunked_cluster_append_func.named_parameters["termid_end"] =
+      LogicalType::BIGINT;
+
+  auto create_fts_index_chunked_finalize_func = PragmaFunction::PragmaCall(
+      "create_fts_index_chunked_finalize",
+      FTSIndexing::CreateFTSIndexChunkedFinalizeQuery, {LogicalType::VARCHAR});
+  create_fts_index_chunked_finalize_func.named_parameters["stemmer"] =
+      LogicalType::VARCHAR;
+  create_fts_index_chunked_finalize_func.named_parameters["layered_search"] =
+      LogicalType::BOOLEAN;
+
   auto drop_fts_index_func = PragmaFunction::PragmaCall(
       "drop_fts_index", FTSIndexing::DropFTSIndexQuery, {LogicalType::VARCHAR});
 
   loader.RegisterFunction(stem_func);
   loader.RegisterFunction(create_fts_index_func);
+  loader.RegisterFunction(create_fts_index_chunked_func);
+  loader.RegisterFunction(create_fts_index_chunked_init_func);
+  loader.RegisterFunction(create_fts_index_chunked_append_func);
+  loader.RegisterFunction(create_fts_index_chunked_cluster_begin_func);
+  loader.RegisterFunction(create_fts_index_chunked_cluster_append_func);
+  loader.RegisterFunction(create_fts_index_chunked_finalize_func);
   loader.RegisterFunction(drop_fts_index_func);
 }
 

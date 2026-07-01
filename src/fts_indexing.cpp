@@ -3,11 +3,13 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/qualified_name.hpp"
@@ -102,6 +104,30 @@ static string GetFTSBuildTermsTable(const QualifiedName &qname) {
 
 static string GetFTSBuildDictTable(const QualifiedName &qname) {
   return SQLIdentifier::ToString("__fts_build_dict_" + GetFTSSchemaName(qname));
+}
+
+static string GetFTSBuildChunkTermsTable(const QualifiedName &qname) {
+  return SQLIdentifier::ToString("__fts_build_chunk_terms_" +
+                                 GetFTSSchemaName(qname));
+}
+
+static string GetFTSBuildChunkNewTermsTable(const QualifiedName &qname) {
+  return SQLIdentifier::ToString("__fts_build_chunk_new_terms_" +
+                                 GetFTSSchemaName(qname));
+}
+
+static string GetFTSBuildChunkTermStatsTable(const QualifiedName &qname) {
+  return SQLIdentifier::ToString("__fts_build_chunk_term_stats_" +
+                                 GetFTSSchemaName(qname));
+}
+
+static string GetFTSBuildDictTermIndex(const QualifiedName &qname) {
+  return SQLIdentifier::ToString("__fts_" + GetFTSSchemaName(qname) +
+                                 "_build_dict_term_idx");
+}
+
+static string GetFTSQualifiedBuildDictTermIndex(const QualifiedName &qname) {
+  return GetFTSSchema(qname) + "." + GetFTSBuildDictTermIndex(qname);
 }
 
 static string GetFTSTermStatsTermIndex(const QualifiedName &qname) {
@@ -341,6 +367,285 @@ static string IndexTablesScript(const string &input_id,
                           StringUtil::Join(tokenize_fields, " UNION ALL "));
   result = StringUtil::Replace(result, "%input_id%",
                                SQLIdentifier::ToString(input_id));
+  return result;
+}
+
+static string LayeredSidecarScript(const QualifiedName &qname);
+static string MatchMacroScript();
+static string LayeredSearchMacroScript();
+
+static string ChunkedBuildInitScript(const string &input_id,
+                                     const vector<string> &input_values,
+                                     const string &stemmer,
+                                     const string &stopwords,
+                                     const QualifiedName &qname) {
+  // clang-format off
+	string result = R"(
+        CREATE TABLE %fts_schema%.fields (fieldid BIGINT, field VARCHAR);
+        INSERT INTO %fts_schema%.fields VALUES %field_values%;
+
+        CREATE TABLE %fts_schema%.docs (docid BIGINT, name VARCHAR, len BIGINT);
+        CREATE TABLE %fts_schema%.dict (termid BIGINT, term VARCHAR, df BIGINT);
+        CREATE TABLE %fts_schema%.terms (termid BIGINT, docid BIGINT, fieldid BIGINT);
+        CREATE TABLE %fts_schema%.__build_state (next_termid BIGINT);
+        CREATE TABLE %fts_schema%.__build_term_df (termid BIGINT, df BIGINT);
+        INSERT INTO %fts_schema%.__build_state VALUES (0);
+        CREATE INDEX %build_dict_term_index% ON %fts_schema%.dict(term);
+
+        CREATE MACRO %fts_schema%.__chunk_terms(rowid_start, rowid_end) AS TABLE
+        WITH tokenized AS (
+            %union_fields_query%
+        ),
+        stemmed_stopped AS (
+            SELECT %term_expression% AS term,
+                   t.docid AS docid,
+                   t.fieldid AS fieldid
+            FROM tokenized AS t
+            WHERE t.w NOT NULL
+              AND t.w <> ''
+              %stopwords_filter%
+        )
+        SELECT ss.term,
+               ss.docid,
+               ss.fieldid
+        FROM stemmed_stopped AS ss;
+
+        CREATE MACRO %fts_schema%.__chunk_source_docs(rowid_start, rowid_end) AS TABLE
+        SELECT fts_docs.rowid AS docid,
+               fts_docs.%input_id% AS name
+        FROM %input_table% AS fts_docs
+        WHERE fts_docs.rowid BETWEEN rowid_start AND rowid_end
+        ORDER BY fts_docs.rowid;
+    )";
+
+	string tokenize_field_query = R"(
+        SELECT unnest(%fts_schema%.tokenize(fts_ii.%input_value%)) AS w,
+               fts_ii.rowid AS docid,
+               %field_id% AS fieldid
+        FROM %input_table% AS fts_ii
+        WHERE fts_ii.rowid BETWEEN rowid_start AND rowid_end
+    )";
+  // clang-format on
+
+  string term_expression = stemmer == "none" ? "t.w" : "stem(t.w, '%stemmer%')";
+  string stopwords_filter =
+      stopwords == "none"
+          ? string("")
+          : "AND t.w NOT IN (SELECT sw FROM %fts_schema%.stopwords)";
+
+  vector<string> field_values;
+  vector<string> tokenize_fields;
+  for (idx_t i = 0; i < input_values.size(); i++) {
+    field_values.push_back(StringUtil::Format(
+        "(%i, %s)", i, SQLString::ToString(input_values[i])));
+    auto query = StringUtil::Replace(tokenize_field_query, "%input_value%",
+                                     SQLIdentifier::ToString(input_values[i]));
+    query =
+        StringUtil::Replace(query, "%field_id%", StringUtil::Format("%i", i));
+    tokenize_fields.push_back(query);
+  }
+  result = StringUtil::Replace(result, "%term_expression%", term_expression);
+  result = StringUtil::Replace(result, "%stopwords_filter%", stopwords_filter);
+  result = StringUtil::Replace(result, "%field_values%",
+                               StringUtil::Join(field_values, ", "));
+  result =
+      StringUtil::Replace(result, "%union_fields_query%",
+                          StringUtil::Join(tokenize_fields, " UNION ALL "));
+  result = StringUtil::Replace(result, "%build_dict_term_index%",
+                               GetFTSBuildDictTermIndex(qname));
+  result = StringUtil::Replace(result, "%input_id%",
+                               SQLIdentifier::ToString(input_id));
+  return result;
+}
+
+static string ChunkedBuildAppendScript(const string &chunk_terms_table,
+                                       const string &chunk_new_terms_table,
+                                       const string &chunk_term_stats_table,
+                                       int64_t rowid_start,
+                                       int64_t rowid_end) {
+  // clang-format off
+	string result = R"(
+        DROP TABLE IF EXISTS temp.%chunk_terms_table%;
+        DROP TABLE IF EXISTS temp.%chunk_new_terms_table%;
+        DROP TABLE IF EXISTS temp.%chunk_term_stats_table%;
+
+        CREATE TEMP TABLE %chunk_terms_table% AS
+        SELECT term,
+               docid,
+               fieldid
+        FROM %fts_schema%.__chunk_terms(%rowid_start%, %rowid_end%);
+
+        INSERT INTO %fts_schema%.docs
+        WITH lengths AS (
+            SELECT docid,
+                   count(*)::BIGINT AS len
+            FROM temp.%chunk_terms_table%
+            GROUP BY docid
+        )
+        SELECT source_docs.docid,
+               source_docs.name,
+               coalesce(lengths.len, 0)::BIGINT AS len
+        FROM %fts_schema%.__chunk_source_docs(%rowid_start%, %rowid_end%) AS source_docs
+        LEFT JOIN lengths
+          ON lengths.docid = source_docs.docid
+        ORDER BY source_docs.docid;
+
+        CREATE TEMP TABLE %chunk_term_stats_table% AS
+        SELECT term,
+               min(docid) AS first_docid,
+               count(DISTINCT docid)::BIGINT AS df
+        FROM temp.%chunk_terms_table%
+        GROUP BY term;
+
+        CREATE TEMP TABLE %chunk_new_terms_table% AS
+        SELECT chunk_terms.term,
+               chunk_terms.first_docid
+        FROM temp.%chunk_term_stats_table% AS chunk_terms
+        LEFT JOIN %fts_schema%.dict AS dict
+          ON dict.term = chunk_terms.term
+        WHERE dict.termid IS NULL
+        ORDER BY chunk_terms.first_docid,
+                 chunk_terms.term;
+
+        INSERT INTO %fts_schema%.dict
+        SELECT build_state.next_termid + row_number() OVER (ORDER BY new_terms.first_docid, new_terms.term) - 1 AS termid,
+               new_terms.term,
+               0::BIGINT AS df
+        FROM temp.%chunk_new_terms_table% AS new_terms
+        CROSS JOIN %fts_schema%.__build_state AS build_state;
+
+        UPDATE %fts_schema%.__build_state
+        SET next_termid = next_termid + (
+            SELECT count(*)::BIGINT
+            FROM temp.%chunk_new_terms_table%
+        );
+
+        INSERT INTO %fts_schema%.__build_term_df
+        SELECT dict.termid,
+               chunk_terms.df
+        FROM temp.%chunk_term_stats_table% AS chunk_terms
+        JOIN %fts_schema%.dict AS dict
+          ON dict.term = chunk_terms.term
+        ORDER BY dict.termid;
+
+        INSERT INTO %fts_schema%.terms
+        SELECT dict.termid,
+               chunk_terms.docid,
+               chunk_terms.fieldid
+        FROM temp.%chunk_terms_table% AS chunk_terms
+        JOIN %fts_schema%.dict AS dict
+          ON dict.term = chunk_terms.term
+        ORDER BY dict.termid,
+                 chunk_terms.fieldid,
+                 chunk_terms.docid;
+
+        DROP TABLE temp.%chunk_term_stats_table%;
+        DROP TABLE temp.%chunk_new_terms_table%;
+        DROP TABLE temp.%chunk_terms_table%;
+    )";
+  // clang-format on
+
+  result = StringUtil::Replace(result, "%chunk_terms_table%", chunk_terms_table);
+  result = StringUtil::Replace(result, "%chunk_new_terms_table%",
+                               chunk_new_terms_table);
+  result = StringUtil::Replace(result, "%chunk_term_stats_table%",
+                               chunk_term_stats_table);
+  result = StringUtil::Replace(result, "%rowid_start%",
+                               StringUtil::Format("%lld", rowid_start));
+  result = StringUtil::Replace(result, "%rowid_end%",
+                               StringUtil::Format("%lld", rowid_end));
+  return result;
+}
+
+static string ChunkedBuildClusterBeginScript() {
+  // clang-format off
+	return R"(
+        DROP TABLE IF EXISTS %fts_schema%.__build_terms;
+        ALTER TABLE %fts_schema%.terms RENAME TO __build_terms;
+        DROP TABLE IF EXISTS %fts_schema%.terms;
+        CREATE TABLE %fts_schema%.terms (termid BIGINT, docid BIGINT, fieldid BIGINT);
+    )";
+  // clang-format on
+}
+
+static string ChunkedBuildClusterAppendScript(int64_t termid_start,
+                                              int64_t termid_end) {
+  // clang-format off
+	string result = R"(
+        INSERT INTO %fts_schema%.terms
+        SELECT termid,
+               docid,
+               fieldid
+        FROM %fts_schema%.__build_terms
+        WHERE termid BETWEEN %termid_start% AND %termid_end%
+        ORDER BY termid,
+                 fieldid,
+                 docid;
+    )";
+  // clang-format on
+
+  result = StringUtil::Replace(result, "%termid_start%",
+                               StringUtil::Format("%lld", termid_start));
+  result = StringUtil::Replace(result, "%termid_end%",
+                               StringUtil::Format("%lld", termid_end));
+  return result;
+}
+
+static string ChunkedBuildFinalizeScript(const QualifiedName &qname,
+                                         bool layered_search) {
+  // clang-format off
+	string result = R"(
+        CREATE TABLE %fts_schema%.stats AS (
+            SELECT COUNT(docs.docid) AS num_docs,
+                   SUM(docs.len) / COUNT(docs.len) AS avgdl
+            FROM %fts_schema%.docs AS docs
+        );
+
+        DROP INDEX IF EXISTS %qualified_build_dict_term_index%;
+
+        CREATE TABLE %fts_schema%.__build_dict_final AS
+        SELECT dict.termid,
+               dict.term,
+               coalesce(term_df.df, 0)::BIGINT AS df
+        FROM %fts_schema%.dict AS dict
+        LEFT JOIN (
+            SELECT termid,
+                   sum(df)::BIGINT AS df
+            FROM %fts_schema%.__build_term_df
+            GROUP BY termid
+        ) AS term_df
+          ON term_df.termid = dict.termid
+        ORDER BY dict.termid;
+
+        DROP TABLE %fts_schema%.dict;
+        ALTER TABLE %fts_schema%.__build_dict_final RENAME TO dict;
+
+        %match_macro_script%
+        %layered_sidecar_script%
+        %layered_search_macro_script%
+
+        DROP TABLE IF EXISTS %fts_schema%.__build_terms;
+        DROP TABLE IF EXISTS %fts_schema%.__build_state;
+        DROP TABLE IF EXISTS %fts_schema%.__build_term_df;
+        DROP MACRO IF EXISTS %fts_schema%.__chunk_terms;
+        DROP MACRO IF EXISTS %fts_schema%.__chunk_source_docs;
+
+        ANALYZE %fts_schema%.docs;
+        ANALYZE %fts_schema%.dict;
+        ANALYZE %fts_schema%.terms;
+    )";
+  // clang-format on
+
+  result =
+      StringUtil::Replace(result, "%match_macro_script%", MatchMacroScript());
+  result = StringUtil::Replace(
+      result, "%layered_sidecar_script%",
+      layered_search ? LayeredSidecarScript(qname) : "");
+  result = StringUtil::Replace(
+      result, "%layered_search_macro_script%",
+      layered_search ? LayeredSearchMacroScript() : "");
+  result = StringUtil::Replace(result, "%qualified_build_dict_term_index%",
+                               GetFTSQualifiedBuildDictTermIndex(qname));
   return result;
 }
 
@@ -1385,6 +1690,15 @@ static string DeleteTriggerScript(const QualifiedName &qname,
 // Coordinator: assembles all parts and substitutes cross-cutting placeholders
 // ---------------------------------------------------------------------------
 
+static string ApplyCommonReplacements(string result, const QualifiedName &qname,
+                                      const string &stemmer) {
+  result = StringUtil::Replace(result, "%fts_schema%", GetFTSSchema(qname));
+  result =
+      StringUtil::Replace(result, "%input_table%", GetQualifiedTableName(qname));
+  result = StringUtil::Replace(result, "%stemmer%", stemmer);
+  return result;
+}
+
 static string IndexingScript(ClientContext &context, QualifiedName &qname,
                              const string &input_id,
                              const vector<string> &input_values,
@@ -1415,18 +1729,148 @@ static string IndexingScript(ClientContext &context, QualifiedName &qname,
         DeleteTriggerScript(qname, input_id, input_values, layered_search);
   }
 
-  string fts_schema = GetFTSSchema(qname);
-  string input_table = GetQualifiedTableName(qname);
-
-  result = StringUtil::Replace(result, "%fts_schema%", fts_schema);
-  result = StringUtil::Replace(result, "%input_table%", input_table);
-  result = StringUtil::Replace(result, "%stemmer%", stemmer);
-  return result;
+  return ApplyCommonReplacements(result, qname, stemmer);
 }
 
 // ---------------------------------------------------------------------------
 // PRAGMA implementations
 // ---------------------------------------------------------------------------
+
+static bool HasParameter(const FunctionParameters &parameters,
+                         const string &name) {
+  return parameters.named_parameters.find(Identifier(name)) !=
+         parameters.named_parameters.end();
+}
+
+static string GetStringParameter(const FunctionParameters &parameters,
+                                 const string &name, const string &def) {
+  auto it = parameters.named_parameters.find(Identifier(name));
+  return it != parameters.named_parameters.end() ? StringValue::Get(it->second)
+                                                 : def;
+}
+
+static bool GetBoolParameter(const FunctionParameters &parameters,
+                             const string &name, bool def) {
+  auto it = parameters.named_parameters.find(Identifier(name));
+  return it != parameters.named_parameters.end() ? BooleanValue::Get(it->second)
+                                                 : def;
+}
+
+static int64_t GetRequiredBigIntParameter(const FunctionParameters &parameters,
+                                          const string &name) {
+  auto it = parameters.named_parameters.find(Identifier(name));
+  if (it == parameters.named_parameters.end()) {
+    throw InvalidInputException("missing required parameter '%s'", name);
+  }
+  auto result = BigIntValue::Get(it->second);
+  if (result < 0) {
+    throw InvalidInputException("parameter '%s' must be non-negative", name);
+  }
+  return result;
+}
+
+static void ValidateRange(const string &start_name, int64_t start,
+                          const string &end_name, int64_t end) {
+  if (end < start) {
+    throw InvalidInputException("parameter '%s' must be greater than or equal "
+                                "to parameter '%s'",
+                                end_name, start_name);
+  }
+}
+
+static void ExecuteSQL(Connection &connection, const string &sql) {
+  auto result = connection.Query(sql);
+  if (result->HasError()) {
+    result->ThrowError();
+  }
+}
+
+static Value ExecuteScalar(Connection &connection, const string &sql) {
+  auto result = connection.Query(sql);
+  if (result->HasError()) {
+    result->ThrowError();
+  }
+  auto chunk = result->Fetch();
+  if (!chunk || chunk->size() == 0) {
+    return Value();
+  }
+  return chunk->GetValue(0, 0);
+}
+
+static int64_t ExecuteScalarBigInt(Connection &connection, const string &sql) {
+  auto value = ExecuteScalar(connection, sql);
+  if (value.IsNull()) {
+    return 0;
+  }
+  return value.GetValue<int64_t>();
+}
+
+static const Value *
+GetOptionalNamedParameter(const FunctionParameters &parameters,
+                          const string &name) {
+  auto it = parameters.named_parameters.find(Identifier(name));
+  if (it == parameters.named_parameters.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+static int64_t ClampChunkSize(int64_t chunk_size, int64_t total_rows) {
+  if (total_rows <= 0) {
+    return 1;
+  }
+  constexpr int64_t MIN_CHUNK_SIZE = 50000;
+  constexpr int64_t MAX_CHUNK_SIZE = 500000;
+  chunk_size = MaxValue<int64_t>(chunk_size, MIN_CHUNK_SIZE);
+  chunk_size = MinValue<int64_t>(chunk_size, MAX_CHUNK_SIZE);
+  chunk_size = MinValue<int64_t>(chunk_size, total_rows);
+  return MaxValue<int64_t>(chunk_size, int64_t(1));
+}
+
+static int64_t GetChunkTargetOccurrences(const string &policy) {
+  auto normalized_policy = StringUtil::Lower(policy);
+  if (normalized_policy == "memory_safe") {
+    return 3000000;
+  }
+  if (normalized_policy == "balanced") {
+    return 8000000;
+  }
+  if (normalized_policy == "throughput") {
+    return 15000000;
+  }
+  throw InvalidInputException(
+      "invalid chunk_size_policy '%s'. Expected one of: memory_safe, balanced, "
+      "throughput",
+      policy);
+}
+
+static int64_t EstimateAutoChunkSize(Connection &connection,
+                                     const QualifiedName &qname,
+                                     int64_t max_rowid, const string &policy) {
+  auto total_rows = max_rowid + 1;
+  if (total_rows <= 0) {
+    return 1;
+  }
+
+  constexpr int64_t SAMPLE_ROWS = 10000;
+  auto sample_end = MinValue<int64_t>(max_rowid, SAMPLE_ROWS - 1);
+  auto sample_stats = ExecuteScalarBigInt(
+      connection,
+      StringUtil::Format("SELECT count(*) FROM %s.__chunk_terms(0, %lld);",
+                         GetFTSSchema(qname), sample_end));
+  auto sample_doc_count = sample_end + 1;
+  if (sample_stats <= 0 || sample_doc_count <= 0) {
+    return ClampChunkSize(100000, total_rows);
+  }
+
+  auto target_occurrences = GetChunkTargetOccurrences(policy);
+  auto estimated_chunk_size =
+      static_cast<int64_t>(target_occurrences /
+                           MaxValue<double>(
+                               1.0, static_cast<double>(sample_stats) /
+                                        static_cast<double>(sample_doc_count)));
+  return ClampChunkSize(estimated_chunk_size, total_rows);
+}
 
 string FTSIndexing::DropFTSIndexQuery(ClientContext &context,
                                       const FunctionParameters &parameters) {
@@ -1452,6 +1896,278 @@ string FTSIndexing::DropFTSIndexQuery(ClientContext &context,
   return result;
 }
 
+string FTSIndexing::CreateFTSIndexChunkedInitQuery(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+
+  const string stemmer = GetStringParameter(parameters, "stemmer", "porter");
+  const string stopwords =
+      GetStringParameter(parameters, "stopwords", "english");
+  const string ignore = GetStringParameter(
+      parameters, "ignore",
+      "[0-9!@#$%^&*()_+={}\\[\\]:;<>,.?~\\\\/\\|''\"`-]+");
+  const bool strip_accents =
+      GetBoolParameter(parameters, "strip_accents", true);
+  const bool lower = GetBoolParameter(parameters, "lower", true);
+  const bool overwrite = GetBoolParameter(parameters, "overwrite", false);
+
+  if (stopwords != "english" && stopwords != "none") {
+    auto sw_qname = GetQualifiedName(context, stopwords);
+    Catalog::GetEntry<TableCatalogEntry>(context, sw_qname);
+  }
+
+  if (Catalog::GetSchema(context, qname.Catalog(),
+                         Identifier(GetFTSSchemaName(qname)),
+                         OnEntryNotFound::RETURN_NULL) &&
+      !overwrite) {
+    throw CatalogException("a FTS index already exists on table '%s.%s'. "
+                           "Supply 'overwrite=1' to overwrite, or "
+                           "drop the existing index with 'PRAGMA "
+                           "drop_fts_index()' before creating a new one.",
+                           qname.Schema().GetIdentifierName(),
+                           qname.Name().GetIdentifierName());
+  }
+
+  const string doc_id = StringValue::Get(parameters.values[1]);
+  auto &table = Catalog::GetEntry<TableCatalogEntry>(context, qname);
+  if (!table.ColumnExists(Identifier(doc_id))) {
+    throw CatalogException("Table '%s.%s' does not have a column named '%s'!",
+                           qname.Schema().GetIdentifierName(),
+                           qname.Name().GetIdentifierName(), doc_id);
+  }
+  vector<string> doc_values;
+  for (idx_t i = 2; i < parameters.values.size(); i++) {
+    const string col_name = StringValue::Get(parameters.values[i]);
+    if (col_name == "*") {
+      doc_values.clear();
+      for (auto &cd : table.GetColumns().Logical()) {
+        if (cd.Type() == LogicalType::VARCHAR) {
+          doc_values.push_back(cd.Name().GetIdentifierName());
+        }
+      }
+      break;
+    }
+    if (!table.ColumnExists(Identifier(col_name))) {
+      throw CatalogException("Table '%s.%s' does not have a column named '%s'!",
+                             qname.Schema().GetIdentifierName(),
+                             qname.Name().GetIdentifierName(), col_name);
+    }
+    doc_values.push_back(col_name);
+  }
+  if (doc_values.empty()) {
+    throw InvalidInputException(
+        "at least one column must be supplied for indexing!");
+  }
+
+  string result;
+  if (TableExists(context, qname) && SupportsFTSTriggers(context, qname)) {
+    result += DropFTSTriggersScript(qname);
+  }
+  result += SchemaSetupScript();
+  result += StopwordsScript(stopwords);
+  result += TokenizeMacroScript(ignore, strip_accents, lower);
+  result += ChunkedBuildInitScript(doc_id, doc_values, stemmer, stopwords,
+                                   qname);
+  return ApplyCommonReplacements(result, qname, stemmer);
+}
+
+string FTSIndexing::CreateFTSIndexChunkedAppendQuery(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+
+  auto rowid_start = GetRequiredBigIntParameter(parameters, "rowid_start");
+  auto rowid_end = GetRequiredBigIntParameter(parameters, "rowid_end");
+  ValidateRange("rowid_start", rowid_start, "rowid_end", rowid_end);
+
+  auto result = ChunkedBuildAppendScript(
+      GetFTSBuildChunkTermsTable(qname), GetFTSBuildChunkNewTermsTable(qname),
+      GetFTSBuildChunkTermStatsTable(qname), rowid_start, rowid_end);
+  return ApplyCommonReplacements(result, qname, "porter");
+}
+
+string FTSIndexing::CreateFTSIndexChunkedClusterBeginQuery(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+
+  return ApplyCommonReplacements(ChunkedBuildClusterBeginScript(), qname,
+                                 "porter");
+}
+
+string FTSIndexing::CreateFTSIndexChunkedClusterAppendQuery(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+
+  auto termid_start = GetRequiredBigIntParameter(parameters, "termid_start");
+  auto termid_end = GetRequiredBigIntParameter(parameters, "termid_end");
+  ValidateRange("termid_start", termid_start, "termid_end", termid_end);
+
+  auto result = ChunkedBuildClusterAppendScript(termid_start, termid_end);
+  return ApplyCommonReplacements(result, qname, "porter");
+}
+
+string FTSIndexing::CreateFTSIndexChunkedFinalizeQuery(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+
+  const string stemmer = GetStringParameter(parameters, "stemmer", "porter");
+  const bool layered_search =
+      GetBoolParameter(parameters, "layered_search", false);
+
+  auto result = ChunkedBuildFinalizeScript(qname, layered_search);
+  return ApplyCommonReplacements(result, qname, stemmer);
+}
+
+void FTSIndexing::CreateFTSIndexChunked(
+    ClientContext &context, const FunctionParameters &parameters) {
+  auto qname =
+      GetQualifiedName(context, StringValue::Get(parameters.values[0]));
+  Catalog::GetEntry<TableCatalogEntry>(context, qname);
+  Connection connection(*context.db);
+
+  const string stemmer = GetStringParameter(parameters, "stemmer", "porter");
+  const string stopwords =
+      GetStringParameter(parameters, "stopwords", "english");
+  const string ignore = GetStringParameter(
+      parameters, "ignore",
+      "[0-9!@#$%^&*()_+={}\\[\\]:;<>,.?~\\\\/\\|''\"`-]+");
+  const bool strip_accents =
+      GetBoolParameter(parameters, "strip_accents", true);
+  const bool lower = GetBoolParameter(parameters, "lower", true);
+  const bool overwrite = GetBoolParameter(parameters, "overwrite", false);
+  const bool layered_search =
+      GetBoolParameter(parameters, "layered_search", false);
+  const bool cluster_terms = HasParameter(parameters, "cluster_terms")
+                                 ? GetBoolParameter(parameters, "cluster_terms",
+                                                    false)
+                                 : layered_search;
+  const string chunk_size_policy =
+      GetStringParameter(parameters, "chunk_size_policy", "balanced");
+  GetChunkTargetOccurrences(chunk_size_policy);
+  auto termid_chunk_size_value =
+      GetOptionalNamedParameter(parameters, "termid_chunk_size");
+  int64_t termid_chunk_size = termid_chunk_size_value
+                                  ? termid_chunk_size_value->GetValue<int64_t>()
+                                  : 100000;
+  if (termid_chunk_size <= 0) {
+    throw InvalidInputException(
+        "parameter 'termid_chunk_size' must be positive");
+  }
+
+  if (stopwords != "english" && stopwords != "none") {
+    auto sw_qname = GetQualifiedName(context, stopwords);
+    Catalog::GetEntry<TableCatalogEntry>(context, sw_qname);
+  }
+
+  if (Catalog::GetSchema(context, qname.Catalog(),
+                         Identifier(GetFTSSchemaName(qname)),
+                         OnEntryNotFound::RETURN_NULL) &&
+      !overwrite) {
+    throw CatalogException("a FTS index already exists on table '%s.%s'. "
+                           "Supply 'overwrite=1' to overwrite, or "
+                           "drop the existing index with 'PRAGMA "
+                           "drop_fts_index()' before creating a new one.",
+                           qname.Schema().GetIdentifierName(),
+                           qname.Name().GetIdentifierName());
+  }
+
+  const string doc_id = StringValue::Get(parameters.values[1]);
+  auto &table = Catalog::GetEntry<TableCatalogEntry>(context, qname);
+  if (!table.ColumnExists(Identifier(doc_id))) {
+    throw CatalogException("Table '%s.%s' does not have a column named '%s'!",
+                           qname.Schema().GetIdentifierName(),
+                           qname.Name().GetIdentifierName(), doc_id);
+  }
+  vector<string> doc_values;
+  for (idx_t i = 2; i < parameters.values.size(); i++) {
+    const string col_name = StringValue::Get(parameters.values[i]);
+    if (col_name == "*") {
+      doc_values.clear();
+      for (auto &cd : table.GetColumns().Logical()) {
+        if (cd.Type() == LogicalType::VARCHAR) {
+          doc_values.push_back(cd.Name().GetIdentifierName());
+        }
+      }
+      break;
+    }
+    if (!table.ColumnExists(Identifier(col_name))) {
+      throw CatalogException("Table '%s.%s' does not have a column named '%s'!",
+                             qname.Schema().GetIdentifierName(),
+                             qname.Name().GetIdentifierName(), col_name);
+    }
+    doc_values.push_back(col_name);
+  }
+  if (doc_values.empty()) {
+    throw InvalidInputException(
+        "at least one column must be supplied for indexing!");
+  }
+
+  string init_script;
+  if (TableExists(context, qname) && SupportsFTSTriggers(context, qname)) {
+    init_script += DropFTSTriggersScript(qname);
+  }
+  init_script += SchemaSetupScript();
+  init_script += StopwordsScript(stopwords);
+  init_script += TokenizeMacroScript(ignore, strip_accents, lower);
+  init_script +=
+      ChunkedBuildInitScript(doc_id, doc_values, stemmer, stopwords, qname);
+  ExecuteSQL(connection, ApplyCommonReplacements(init_script, qname, stemmer));
+
+  auto max_rowid = ExecuteScalarBigInt(
+      connection, StringUtil::Format("SELECT coalesce(max(rowid), -1) FROM %s;",
+                                     GetQualifiedTableName(qname)));
+
+  int64_t chunk_size;
+  auto chunk_size_value = GetOptionalNamedParameter(parameters, "chunk_size");
+  if (chunk_size_value && !chunk_size_value->IsNull()) {
+    chunk_size = chunk_size_value->GetValue<int64_t>();
+    if (chunk_size <= 0) {
+      throw InvalidInputException("parameter 'chunk_size' must be positive");
+    }
+  } else {
+    chunk_size = EstimateAutoChunkSize(connection, qname, max_rowid,
+                                       chunk_size_policy);
+  }
+
+  for (int64_t start = 0; start <= max_rowid; start += chunk_size) {
+    auto end = MinValue<int64_t>(start + chunk_size - 1, max_rowid);
+    auto append_script = ChunkedBuildAppendScript(
+        GetFTSBuildChunkTermsTable(qname), GetFTSBuildChunkNewTermsTable(qname),
+        GetFTSBuildChunkTermStatsTable(qname), start, end);
+    ExecuteSQL(connection,
+               ApplyCommonReplacements(append_script, qname, stemmer));
+  }
+
+  if (cluster_terms) {
+    ExecuteSQL(connection, ApplyCommonReplacements(
+                               ChunkedBuildClusterBeginScript(), qname,
+                               stemmer));
+    auto max_termid = ExecuteScalarBigInt(
+        connection,
+        StringUtil::Format("SELECT coalesce(max(termid), -1) FROM %s.dict;",
+                           GetFTSSchema(qname)));
+    for (int64_t start = 0; start <= max_termid; start += termid_chunk_size) {
+      auto end = MinValue<int64_t>(start + termid_chunk_size - 1, max_termid);
+      auto cluster_script = ChunkedBuildClusterAppendScript(start, end);
+      ExecuteSQL(connection,
+                 ApplyCommonReplacements(cluster_script, qname, stemmer));
+    }
+  }
+
+  auto finalize_script = ChunkedBuildFinalizeScript(qname, layered_search);
+  ExecuteSQL(connection,
+             ApplyCommonReplacements(finalize_script, qname, stemmer));
+}
+
 string FTSIndexing::CreateFTSIndexQuery(ClientContext &context,
                                         const FunctionParameters &parameters) {
   auto qname =
@@ -1471,7 +2187,6 @@ string FTSIndexing::CreateFTSIndexQuery(ClientContext &context,
                ? BooleanValue::Get(it->second)
                : def;
   };
-
   const string stemmer = get_string("stemmer", "porter");
   const string stopwords = get_string("stopwords", "english");
   const string ignore =
@@ -1481,7 +2196,9 @@ string FTSIndexing::CreateFTSIndexQuery(ClientContext &context,
   const bool overwrite = get_bool("overwrite", false);
   const bool incremental = get_bool("incremental", false);
   const bool layered_search = get_bool("layered_search", false);
-  const bool cluster_terms = get_bool("cluster_terms", false) || layered_search;
+  const bool cluster_terms = HasParameter(parameters, "cluster_terms")
+                                 ? get_bool("cluster_terms", false)
+                                 : layered_search;
 
   if (stopwords != "english" && stopwords != "none") {
     auto sw_qname = GetQualifiedName(context, stopwords);

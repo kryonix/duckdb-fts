@@ -186,6 +186,27 @@ FROM fts_main_static_layered_documents.search_layered_bm25('alpha', enable_short
 doc1
 
 statement ok
+CREATE TABLE unclustered_layered_documents(id VARCHAR, body VARCHAR)
+
+statement ok
+INSERT INTO unclustered_layered_documents VALUES ('doc1', 'zeta alpha'), ('doc2', 'beta')
+
+statement ok
+PRAGMA create_fts_index('unclustered_layered_documents', 'id', 'body', stemmer='none', stopwords='none', layered_search=true, cluster_terms=false)
+
+query I
+SELECT count(*)
+FROM fts_main_unclustered_layered_documents.term_stats
+----
+3
+
+query I
+SELECT docname
+FROM fts_main_unclustered_layered_documents.search_layered_bm25('alpha', enable_short_fuzzy := false)
+----
+doc1
+
+statement ok
 INSERT INTO static_layered_documents VALUES ('doc2', 'beta')
 
 query I

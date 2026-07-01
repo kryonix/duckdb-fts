@@ -1,0 +1,134 @@
+# name: test/sql/fts/test_chunked_indexing.test
+# description: Chunked locally clustered FTS index creation
+# group: [fts]
+
+require fts
+
+require no_alternative_verify
+
+statement ok
+CREATE TABLE chunked_docs(id VARCHAR, body VARCHAR, author VARCHAR)
+
+statement ok
+INSERT INTO chunked_docs VALUES
+    ('doc1', 'alpha beta alpha', 'alice'),
+    ('doc2', 'beta gamma', 'bob'),
+    ('doc3', 'gamma delta', 'alice')
+
+statement ok
+PRAGMA create_fts_index_chunked_init('chunked_docs', 'id', 'body', 'author', stemmer='none', stopwords='none', ignore='[^a-z0-9]+', overwrite=true)
+
+statement ok
+PRAGMA create_fts_index_chunked_append('chunked_docs', rowid_start=0, rowid_end=1)
+
+statement ok
+PRAGMA create_fts_index_chunked_append('chunked_docs', rowid_start=2, rowid_end=2)
+
+statement ok
+PRAGMA create_fts_index_chunked_finalize('chunked_docs', stemmer='none', layered_search=true)
+
+query II
+SELECT name, len
+FROM fts_main_chunked_docs.docs
+ORDER BY docid
+----
+doc1	4
+doc2	3
+doc3	3
+
+query II
+SELECT term, df
+FROM fts_main_chunked_docs.dict
+ORDER BY term
+----
+alice	2
+alpha	1
+beta	2
+bob	1
+delta	1
+gamma	2
+
+query I
+SELECT count(*)
+FROM fts_main_chunked_docs.terms
+----
+10
+
+query I
+SELECT count(*)
+FROM information_schema.tables
+WHERE table_schema = 'fts_main_chunked_docs'
+  AND table_name IN ('__build_state', '__build_term_df')
+----
+0
+
+query I
+SELECT count(*)
+FROM duckdb_indexes()
+WHERE schema_name = 'fts_main_chunked_docs'
+  AND index_name LIKE '%build_dict_term_idx'
+----
+0
+
+query I
+SELECT count(*)
+FROM (
+    SELECT termid,
+           fieldid,
+           docid,
+           lag(termid) OVER (ORDER BY rowid) AS previous_termid,
+           lag(fieldid) OVER (ORDER BY rowid) AS previous_fieldid,
+           lag(docid) OVER (ORDER BY rowid) AS previous_docid
+    FROM fts_main_chunked_docs.terms
+    WHERE docid <= 1
+) ordered_terms
+WHERE previous_termid IS NOT NULL
+  AND (
+      termid < previous_termid
+      OR (termid = previous_termid AND fieldid < previous_fieldid)
+      OR (termid = previous_termid AND fieldid = previous_fieldid AND docid < previous_docid)
+  )
+----
+0
+
+query I
+SELECT count(*)
+FROM (
+    SELECT termid,
+           fieldid,
+           docid,
+           lag(termid) OVER (ORDER BY rowid) AS previous_termid,
+           lag(fieldid) OVER (ORDER BY rowid) AS previous_fieldid,
+           lag(docid) OVER (ORDER BY rowid) AS previous_docid
+    FROM fts_main_chunked_docs.terms
+    WHERE docid = 2
+) ordered_terms
+WHERE previous_termid IS NOT NULL
+  AND (
+      termid < previous_termid
+      OR (termid = previous_termid AND fieldid < previous_fieldid)
+      OR (termid = previous_termid AND fieldid = previous_fieldid AND docid < previous_docid)
+  )
+----
+0
+
+query I
+SELECT docname
+FROM fts_main_chunked_docs.search_layered_bm25('alpha', fields := 'body', enable_short_fuzzy := false)
+----
+doc1
+
+query I rowsort
+SELECT docname
+FROM fts_main_chunked_docs.search_layered_bm25('alice', fields := 'author', enable_short_fuzzy := false)
+----
+doc1
+doc3
+
+query I
+SELECT count(*)
+FROM information_schema.tables
+WHERE table_schema = 'fts_main_chunked_docs'
+  AND table_name IN ('term_stats', 'term_stats_by_len', 'term_grams')
+----
+3
